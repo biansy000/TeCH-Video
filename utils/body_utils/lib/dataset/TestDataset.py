@@ -24,10 +24,12 @@ logging.getLogger("trimesh").setLevel(logging.ERROR)
 from lib.pixielib.utils.config import cfg as pixie_cfg
 from lib.pixielib.pixie import PIXIE
 from lib.pixielib.models.SMPLX import SMPLX as PIXIE_SMPLX
-from lib.common.imutils import process_image, load_MODNet
+from lib.common.imutils import process_image
 from lib.common.train_util import Format
 from lib.net.geometry import rotation_matrix_to_angle_axis, rot6d_to_rotmat
 
+from lib.pymafx.core import path_config
+from lib.pymafx.models import pymaf_net
 
 from lib.common.config import cfg
 from lib.common.render import Render
@@ -52,7 +54,6 @@ class TestDataset:
     def __init__(self, cfg, device, no_crop=False):
 
         self.image_dir = cfg["image_dir"]
-        self.image_path = cfg["image_path"]
         self.seg_dir = cfg["seg_dir"]
         self.use_seg = cfg["use_seg"]
         self.hps_type = cfg["hps_type"]
@@ -65,21 +66,21 @@ class TestDataset:
 
         keep_lst = sorted(glob.glob(f"{self.image_dir}/*"))
         img_fmts = ["jpg", "png", "jpeg", "JPG", "bmp", "exr"]
-        if self.image_dir is not None:
-            self.subject_list = sorted(
-                [item for item in keep_lst if item.split(".")[-1] in img_fmts], reverse=False
-            )
-        else:
-            assert self.image_path is not None, "at least one of the param image_dir and image_path should be provided"
-            self.subject_list = [self.image_path]
+
+        self.subject_list = sorted(
+            [item for item in keep_lst if item.split(".")[-1] in img_fmts], reverse=False
+        )
 
         # smpl related
         self.smpl_data = SMPLX()
 
-        if self.hps_type == "pixie":
+        if self.hps_type == "pymafx":
+            self.hps = pymaf_net(path_config.SMPL_MEAN_PARAMS, pretrained=True).to(self.device)
+            self.hps.load_state_dict(torch.load(path_config.CHECKPOINT_FILE)["model"], strict=True)
+            self.hps.eval()
+            pixie_cfg.merge_from_list(["model.n_shape", 10, "model.n_exp", 10])
+        elif self.hps_type == "pixie":
             self.hps = PIXIE(config=pixie_cfg, device=self.device)
-        else:
-            raise NotImplementedError
 
         self.smpl_model = PIXIE_SMPLX(pixie_cfg.model).to(self.device)
 
@@ -93,9 +94,9 @@ class TestDataset:
                 f"SMPL-X estimate with {Format.start} {self.hps_type.upper()} {Format.end}", "green"
             )
         )
-        self.modnet = load_MODNet("thirdparties/MODNet/pretrained/modnet_photographic_portrait_matting.ckpt").to(self.device)
 
         self.render = Render(size=512, device=self.device)
+        self.no_crop=no_crop
 
     def __len__(self):
         return len(self.subject_list)
@@ -147,6 +148,7 @@ class TestDataset:
 
     def read_openpose_keypoints(self, kp_path, aff_path):
         with open(kp_path, 'r') as f:
+            print('kp_path', kp_path)
             data = json.load(f)
         kps = torch.as_tensor(data['people'][0]['face_keypoints_2d'], dtype=torch.float32).reshape(-1, 3)
         aff = torch.as_tensor(np.load(aff_path), dtype=torch.float32)
@@ -160,11 +162,14 @@ class TestDataset:
         img_path = self.subject_list[index]
         img_name = img_path.split("/")[-1].rsplit(".", 1)[0]
 
-        arr_dict = process_image(img_path, self.hps_type, self.single, 1024, self.detector, modnet=self.modnet)
+        arr_dict = process_image(img_path, self.hps_type, self.single, 512, self.detector, no_crop=self.no_crop)
         arr_dict.update({"name": img_name})
 
         kp_path = img_path.replace('.png', '_00_keypoints.json')
         aff_path = img_path.replace('.png', '_00.npy')
+
+        kp_path = kp_path.replace('.jpg', '_00_keypoints.json')
+        aff_path = kp_path.replace('.jpg', '_00.npy')
         print(kp_path)
         if osp.exists(kp_path) and osp.exists(aff_path):
             arr_dict.update({"openpose_keypoints": self.read_openpose_keypoints(kp_path, aff_path)})
@@ -172,8 +177,10 @@ class TestDataset:
         with torch.no_grad():
             if self.hps_type == "pixie":
                 preds_dict = self.hps.forward(arr_dict["img_hps"].to(self.device))
-            else:
-                raise NotImplementedError
+            elif self.hps_type == 'pymafx':
+                batch = {k: v.to(self.device) for k, v in arr_dict["img_pymafx"].items()}
+                preds_dict, _ = self.hps.forward(batch)
+
         arr_dict["smpl_faces"] = (
             torch.as_tensor(self.smpl_data.smplx_faces.astype(np.int64)).unsqueeze(0).long().to(
                 self.device
@@ -181,7 +188,20 @@ class TestDataset:
         )
         arr_dict["type"] = self.smpl_type
 
-        if self.hps_type == "pixie":
+        if self.hps_type == "pymafx":
+            output = preds_dict["mesh_out"][-1]
+            scale, tranX, tranY = output["theta"][:, :3].split(1, dim=1)
+            arr_dict["betas"] = output["pred_shape"]
+            arr_dict["body_pose"] = output["rotmat"][:, 1:22]
+            arr_dict["global_orient"] = output["rotmat"][:, 0:1]
+            arr_dict["smpl_verts"] = output["smplx_verts"]
+            arr_dict["left_hand_pose"] = output["pred_lhand_rotmat"]
+            arr_dict["right_hand_pose"] = output["pred_rhand_rotmat"]
+            arr_dict['jaw_pose'] = output['pred_face_rotmat'][:, 0:1]
+            arr_dict["exp"] = output["pred_exp"]
+            # 1.2009, 0.0013, 0.3954
+
+        elif self.hps_type == "pixie":
             arr_dict.update(preds_dict)
             arr_dict["global_orient"] = preds_dict["global_pose"]
             arr_dict["betas"] = preds_dict["shape"]    #200

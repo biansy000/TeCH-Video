@@ -170,3 +170,35 @@ def laplacian_smooth_loss(v_pos, t_pos_idx):
     term = term / torch.clamp(norm, min=1.0)
 
     return torch.mean(term ** 2)
+
+
+
+from pytorch3d.transforms import axis_angle_to_matrix
+def get_smpl_out(smpl_model, smpl_info):
+    smpl_verts, smpl_verts_rest, smpl_landmarks, smpl_joints, joints_rest, T = smpl_model(
+                    shape_params=smpl_info['betas'].detach(),
+                    expression_params=smpl_info['expression'].detach(),
+                    body_pose=axis_angle_to_matrix(smpl_info['body_pose']).detach(),
+                    global_pose=axis_angle_to_matrix(smpl_info['global_orient']).detach(),
+                    jaw_pose=axis_angle_to_matrix(smpl_info['jaw_pose']).detach(),
+                    left_hand_pose=axis_angle_to_matrix(smpl_info['left_hand_pose']).detach(),
+                    right_hand_pose=axis_angle_to_matrix(smpl_info["right_hand_pose"]).detach(),
+                    return_T=True,
+                )
+    
+    return smpl_verts, smpl_verts_rest, smpl_landmarks, smpl_joints, joints_rest, T
+
+
+# def get_smpl_out_zero_pose(smpl_model, smpl_info):
+#     smpl_verts, smpl_landmarks, smpl_joints, T = smpl_model(
+#                     shape_params=smpl_info['betas'],
+#                     expression_params=smpl_info['expression'],
+#                     body_pose=axis_angle_to_matrix(torch.zeros_like(smpl_info['body_pose'])),
+#                     global_pose=axis_angle_to_matrix(torch.zeros_like(smpl_info['global_orient'])),
+#                     jaw_pose=axis_angle_to_matrix(torch.zeros_like(smpl_info['jaw_pose'])),
+#                     left_hand_pose=axis_angle_to_matrix(torch.zeros_like(smpl_info['left_hand_pose'])),
+#                     right_hand_pose=axis_angle_to_matrix(torch.zeros_like(smpl_info["right_hand_pose"])),
+#                     return_T=True,
+#                 )
+    
+#     return smpl_verts, smpl_landmarks, smpl_joints, T

@@ -12,13 +12,16 @@ import torch.nn.functional as F
 
 import nvdiffrast.torch as dr
 # import kaolin as kal
-from .network_utils import get_encoder
+from encoding import get_encoder
+# # from meshutils import remesh
+from .texture import Texture3D
 
 from .obj import Mesh, safe_normalize
 from .marching_tets import DMTet
-from .tet_utils import build_tet_grid
+from .build_tet_grid import build_tet_grid, build_tet_grid_new
 from .dmtet_network import DMTetMesh
-from .color_network import ColorNetwork
+from .dmtet_network_restpose import DMTetMeshRestPose
+from .dmtet_network_wmask import DMTetMeshWMask
 from .uv_utils import texture_padding
 from PIL import Image
 def scale_img_nhwc(x, size, mag='bilinear', min='bilinear'):
@@ -84,19 +87,25 @@ class Renderer(nn.Module):
 
     def __init__(
         self,
-        cfg,
+        opt,
+        smpl_v_rest=None,
+        smpl_faces=None,
+        # smpl_v=None,
+        rest_T=None,
+        smpl_v_T=None,
+        joints_rest=None,
         num_layers_bg=2,
         hidden_dim_bg=16,
     ):
 
         super().__init__()
 
-        self.cfg = cfg
-        self.min_near = cfg.model.min_near
+        self.opt = opt
+        self.min_near = opt.min_near
         # self.v_offsets = 0
         # self.vn_offsets = 0
 
-        if not self.cfg.use_gl:
+        if not self.opt.use_gl:
             self.glctx = dr.RasterizeCudaContext()  # support at most 2048 resolution.
         else:
             print('building gl context')
@@ -106,52 +115,114 @@ class Renderer(nn.Module):
             # print('Failed to initialize GLContext, use CudaContext instead...')
             # self.glctx = dr.RasterizeCudaContext()  # support at most 2048 resolution.
         # load the template mesh, will calculate normal and texture if not provided.
-        if self.cfg.model.use_color_network:
-            self.texture3d = ColorNetwork(cfg=cfg, num_layers=cfg.model.color_num_layers, hidden_dim=cfg.model.color_hidden_dim, 
-                                          hash_max_res=cfg.model.color_hash_max_res, hash_num_levels=cfg.model.color_hash_num_levels)
-        else:
-            self.texture3d = None
+        self.texture3d = Texture3D(opt)
         
         # TODO: textrue 2D
 
-        if cfg.model.use_dmtet_network:
-            self.mesh = Mesh.load_obj(self.cfg.data.last_model, ref_path=self.cfg.data.last_ref_model, init_empty_tex=self.cfg.train.init_empty_tex, albedo_res=self.cfg.model.albedo_res, keypoints_path=self.cfg.data.keypoints_path, init_uv=False)
+        self.use_pose_control = opt.use_pose_control
+
+        if opt.mesh_resolution > 0: # geo: False
+            tet_file = Path(f'data/tets/{opt.mesh_resolution}_tets.npz').expanduser()
+            tets = np.load(tet_file)
+            print("Loaded base mesh file", tet_file)
+            self.mesh = Mesh(v=torch.tensor(tets['vertices']) * 2.0, f=torch.tensor(tets['indices'], dtype=torch.int32))
+            self.marching_tets = DMTet()
+            self.dmtet_network = None
+
+        elif opt.progressive_geo:
+            self.mesh = Mesh.load_obj(
+                self.opt.last_model, ref_path=self.opt.last_ref_model, init_empty_tex=self.opt.init_empty_tex, albedo_res=self.opt.albedo_res, 
+                keypoints_path=self.opt.keypoints_path, init_uv=False)
             if self.mesh.keypoints is not None:
                 self.keypoints = self.mesh.keypoints
             else:
                 self.keypoints = None
             self.marching_tets = None
-            tet_v, tet_ind = build_tet_grid(self.mesh, cfg)
-            self.dmtet_network = DMTetMesh(vertices=torch.tensor(tet_v, dtype=torch.float), indices=torch.tensor(tet_ind, dtype=torch.long), grid_scale=self.cfg.model.tet_grid_scale, use_explicit=cfg.model.use_explicit_tet, geo_network=cfg.model.dmtet_network, 
-                                           hash_max_res=cfg.model.geo_hash_max_res, hash_num_levels=cfg.model.geo_hash_num_levels, num_subdiv=cfg.model.tet_num_subdiv)
-            if self.cfg.train.init_mesh and not self.cfg.test.test:
-                self.dmtet_network.init_mesh(self.mesh.v, self.mesh.f, self.cfg.train.init_mesh_padding)
+            tet_v, tet_ind = build_tet_grid(self.mesh, opt)
+            self.dmtet_network = DMTetMeshWMask(vertices=torch.tensor(tet_v, dtype=torch.float), indices=torch.tensor(tet_ind, dtype=torch.long), grid_scale=self.opt.tet_grid_scale, use_explicit=opt.use_explicit_tet, geo_network=opt.dmtet_network, 
+                                           hash_max_res=opt.geo_hash_max_res, hash_num_levels=opt.geo_hash_num_levels, num_subdiv=opt.tet_num_subdiv)
+            if self.opt.init_mesh and not self.opt.test:
+                self.dmtet_network.init_mesh(self.mesh.v, self.mesh.f, self.opt.init_mesh_padding)
+        elif opt.use_dmtet_posed: # geo: True
+            self.mesh = Mesh.load_obj(self.opt.last_model.replace('.obj', '_rest.obj'), 
+                                      ref_path=self.opt.last_ref_model, init_empty_tex=self.opt.init_empty_tex,
+                                      albedo_res=self.opt.albedo_res, keypoints_path=self.opt.keypoints_path, init_uv=False)
+            
+            resize_matrix_inv = self.mesh.resize_matrix_inv
+            resize_matrix = resize_matrix_inv.inverse()
+
+            # print('resize_matrix', resize_matrix, resize_matrix_inv)
+            # change to the normalized coordinate system (
+            smpl_v_rest_homo = torch.cat(
+                [smpl_v_rest, torch.ones_like(smpl_v_rest)[:, :, :1]], dim=-1)
+            self.register_buffer('smpl_v_rest', torch.einsum('ij,bkj->bki', resize_matrix, smpl_v_rest_homo)[:, :, :3])
+            self.register_buffer('smpl_faces', smpl_faces)
+            self.register_buffer('rest_T', resize_matrix @ rest_T @ resize_matrix_inv)
+            self.register_buffer('smpl_v_T', resize_matrix @ smpl_v_T @ resize_matrix_inv)
+            joints_rest_homo = torch.cat(
+                [joints_rest, torch.ones_like(joints_rest)[:, :, :1]], dim=-1
+            )
+            self.register_buffer('joints_rest', torch.einsum('ij,bkj->bki', resize_matrix, joints_rest_homo)[:, :, :3])
+
+            # assert False
+
+            if self.mesh.keypoints is not None:
+                self.keypoints = self.mesh.keypoints
+            else:
+                self.keypoints = None
+            self.marching_tets = None
+            tet_v, tet_ind = build_tet_grid_new(self.mesh, opt, smpl_rest_v=smpl_v_rest[0], smpl_faces=smpl_faces[0])
+            self.dmtet_network = DMTetMeshRestPose(vertices=torch.tensor(tet_v, dtype=torch.float), indices=torch.tensor(tet_ind, dtype=torch.long), grid_scale=self.opt.tet_grid_scale, use_explicit=opt.use_explicit_tet, geo_network=opt.dmtet_network, 
+                                           hash_max_res=opt.geo_hash_max_res, hash_num_levels=opt.geo_hash_num_levels, num_subdiv=opt.tet_num_subdiv)
+            if self.opt.init_mesh and not self.opt.test:
+                self.dmtet_network.init_mesh(self.mesh.v, self.mesh.f, 
+                                             smpl_v_rest=self.smpl_v_rest, smpl_faces=self.smpl_faces, rest_T=self.rest_T, smpl_v_T=self.smpl_v_T, 
+                                             init_padding=self.opt.init_mesh_padding)
+        
+        elif opt.use_dmtet_new: # geo: True
+            self.mesh = Mesh.load_obj(
+                self.opt.last_model, ref_path=self.opt.last_ref_model, init_empty_tex=self.opt.init_empty_tex, albedo_res=self.opt.albedo_res, 
+                keypoints_path=self.opt.keypoints_path, init_uv=False)
+            if self.mesh.keypoints is not None:
+                self.keypoints = self.mesh.keypoints
+            else:
+                self.keypoints = None
+            self.marching_tets = None
+            tet_v, tet_ind = build_tet_grid(self.mesh, opt)
+            self.dmtet_network = DMTetMesh(vertices=torch.tensor(tet_v, dtype=torch.float), indices=torch.tensor(tet_ind, dtype=torch.long), grid_scale=self.opt.tet_grid_scale, use_explicit=opt.use_explicit_tet, geo_network=opt.dmtet_network, 
+                                           hash_max_res=opt.geo_hash_max_res, hash_num_levels=opt.geo_hash_num_levels, num_subdiv=opt.tet_num_subdiv)
+            if self.opt.init_mesh and not self.opt.test:
+                self.dmtet_network.init_mesh(self.mesh.v, self.mesh.f, self.opt.init_mesh_padding)
+
         else:
-            self.mesh = Mesh.load_obj(self.cfg.data.last_model, ref_path=self.cfg.data.last_ref_model, init_empty_tex=self.cfg.train.init_empty_tex, albedo_res=self.cfg.model.albedo_res, use_vertex_tex=self.cfg.model.use_vertex_tex, keypoints_path=self.cfg.data.keypoints_path, init_uv=self.cfg.test.save_uv)
+            self.mesh = Mesh.load_obj(self.opt.last_model, ref_path=self.opt.last_ref_model, init_empty_tex=self.opt.init_empty_tex, albedo_res=self.opt.albedo_res, use_vertex_tex=self.opt.use_vertex_tex, keypoints_path=self.opt.keypoints_path, init_uv=self.opt.save_mesh)
             if self.mesh.keypoints is not None:
                 self.keypoints = self.mesh.keypoints
             else:
                 self.keypoints = None
             self.marching_tets = None
             self.dmtet_network = None
-        self.mesh.v = self.mesh.v * self.cfg.model.mesh_scale
-        if cfg.train.init_texture_3d:
+        
+        self.use_dmtet_posed = opt.use_dmtet_posed
+
+        self.mesh.v = self.mesh.v * self.opt.mesh_scale
+        if opt.init_texture_3d:
             self.init_texture_3d()
 
-        if cfg.model.use_vertex_tex:
+        if opt.use_vertex_tex:
             self.vertex_albedo = nn.Parameter(self.mesh.v_color)
         # extract trainable parameters
-        if self.dmtet_network is None and not cfg.train.lock_geo:
+        if self.dmtet_network is None and not opt.lock_geo:
             self.sdf = nn.Parameter(torch.zeros_like(self.mesh.v[..., 0]))
             self.v_offsets = nn.Parameter(torch.zeros_like(self.mesh.v))
             self.vn_offsets = nn.Parameter(torch.zeros_like(self.mesh.v))
         
-        if self.cfg.data.can_pose_folder:
+        if self.opt.can_pose_folder:
             import glob
-            if '.obj' in self.cfg.data.can_pose_folder:
-                can_pose_objs = [self.cfg.data.can_pose_folder]
+            if '.obj' in self.opt.can_pose_folder:
+                can_pose_objs = [self.opt.can_pose_folder]
             else:    
-                can_pose_objs = glob.glob(self.cfg.data.can_pose_folder + '/*.obj')
+                can_pose_objs = glob.glob(self.opt.can_pose_folder + '/*.obj')
             self.can_pose_vertices = []
             self.can_pose_faces = []
             self.can_pose_resize_inv = []
@@ -162,21 +233,25 @@ class Renderer(nn.Module):
                 self.can_pose_vertices.append(mesh.v)
                 self.can_pose_faces.append(mesh.f)
                 
+
         # background network
         self.encoder_bg, self.in_dim_bg = get_encoder('frequency_torch', input_dim=3, multires=4)
-        if self.cfg.model.different_bg:
+        self.bg_net = MLP(self.in_dim_bg, 3, hidden_dim_bg, num_layers_bg, bias=True)
+        if self.opt.different_bg:
             self.normal_bg_net = MLP(self.in_dim_bg, 3, hidden_dim_bg, num_layers_bg, bias=True)
             self.textureless_bg_net = MLP(self.in_dim_bg, 3, hidden_dim_bg, num_layers_bg, bias=True)
-        else:
-            self.bg_net = MLP(self.in_dim_bg, 3, hidden_dim_bg, num_layers_bg, bias=True)
+        # NOTE: similiar bg_net in texture3d
 
+        # TEST: a hashgrid color encoder for color
+        # self.encoder, self.in_dim = get_encoder('hashgrid', input_dim=3, log2_hashmap_size=19, desired_resolution=2048, interpolation='smoothstep')
+        # self.color_net = MLP(self.in_dim, 3, 32, 2, bias=True)
 
     def init_texture_3d(self):
         self.texture3d = self.texture3d.cuda()
         optimizer = torch.optim.Adam(self.texture3d.parameters(), lr=0.01, betas=(0.9, 0.99),
                                             eps=1e-15)
-        os.makedirs(self.cfg.workspace, exist_ok=True)
-        ckpt_path = os.path.join(self.cfg.workspace, 'init_tex.pth')
+        os.makedirs(self.opt.workspace, exist_ok=True)
+        ckpt_path = os.path.join(self.opt.workspace, 'init_tex.pth')
         if os.path.exists(ckpt_path):
             state_dict = torch.load(ckpt_path)
             self.texture3d.load_state_dict(state_dict)
@@ -192,39 +267,61 @@ class Renderer(nn.Module):
                 optimizer.zero_grad()
                 indice = random.sample(range(num_pts), min(batch_size, num_pts))
                 batch_pos = v_pos[indice].cuda()
+                batch_norm = v_norm[indice].cuda()
                 batch_color = v_color[indice].cuda()
-                pred_color = self.texture3d(batch_pos)
+                _, pred_color, pred_norm = self.texture3d(batch_pos, None, shading='output')
+                loss_norm = nn.functional.mse_loss(pred_norm, batch_norm)
                 loss_rgb = nn.functional.mse_loss(pred_color, batch_color)
-                loss = loss_rgb 
+                loss = loss_rgb + loss_norm
                 loss.backward()
                 optimizer.step()
                 print('Iter {}: loss_norm: {}, loss_rgb: {}'.format(i, loss_norm.data, loss_rgb.data))
             torch.save(self.texture3d.state_dict(), ckpt_path)
 
 
+    def get_initial_guess(self, init_normal=True):
+        if self.opt.last_model.endswith('.obj') or self.opt.last_model.endswith('.ply'):
+            return
+        pth = torch.load(self.opt.last_model, map_location='cpu')
+        self.texture3d.load_state_dict(pth['model'])
+        print('Loaded last model from', self.opt.last_model)
+
+        sigma, albedo, enc = self.texture3d.common_forward(self.mesh.v)
+        self.sdf.data.copy_(sigma - min(pth['mean_density'], self.opt.density_thresh))  # like export_mesh
+
+        if init_normal:
+            normal = self.texture3d.normal_net(enc)
+            normal = safe_normalize(normal)
+            normal = torch.nan_to_num(normal)
+            self.vn_offsets.data.copy_(normal)
+
     # optimizer utils
     def get_params(self, lr):
         # yapf: disable
 
-        if self.cfg.model.different_bg:
+        params = [
+            # {'params': self.raw_albedo, 'lr': lr * 10},
+            # {'params': self.encoder.parameters(), 'lr': lr * 10},
+            # {'params': self.color_net.parameters(), 'lr': lr},
+            {'params': self.bg_net.parameters(), 'lr': lr},
+        ]
+        if self.opt.different_bg:
             params += [
                 {'params': self.textureless_bg_net.parameters(), 'lr': lr},
                 {'params': self.normal_bg_net.parameters(), 'lr': lr},
             ]
-        else:
-            params = [
-                {'params': self.bg_net.parameters(), 'lr': lr},
-            ]
 
         if self.texture3d is not None:
             params += [
-                {'params': self.texture3d.parameters(),    'lr': lr},
+                {'params': self.texture3d.encoder.parameters(),    'lr': lr},
+                {'params': self.texture3d.sigma_net.parameters(),  'lr': lr},
+                {'params': self.texture3d.normal_net.parameters(), 'lr': lr},
             ]
 
-        if not self.cfg.train.lock_geo:
+        if not self.opt.lock_geo:
             if self.dmtet_network is not None:
                 params.extend([
-                    {'params': self.dmtet_network.parameters(), 'lr': lr*self.cfg.train.dmtet_lr}
+                    {'params': self.dmtet_network.parameters(), 'lr': lr*self.opt.dmtet_lr}
                 ])
             else:
                 params.extend([
@@ -232,7 +329,7 @@ class Renderer(nn.Module):
                     {'params': self.vn_offsets, 'lr': 0.0001},
                 ])
         # yapf: enable
-        if self.cfg.model.use_vertex_tex:
+        if self.opt.use_vertex_tex:
             vertex_tex_lr = lr * 1
             params.extend([
                 {'params': self.vertex_albedo, 'lr': vertex_tex_lr}
@@ -242,12 +339,23 @@ class Renderer(nn.Module):
     
 
     @torch.no_grad()
-    def export_mesh(self, save_path, name='mesh', export_uv=False):
+    def export_mesh(self, save_path, smpl_v_T=None, name='mesh', export_uv=False):
         self.resize_matrix_inv = self.mesh.resize_matrix_inv
         if self.dmtet_network is not None:
             num_subdiv = self.get_num_subdiv()
             with torch.no_grad():
-                verts, faces, loss = self.dmtet_network.get_mesh(return_loss=False, num_subdiv=num_subdiv)
+                # verts, faces, loss = self.dmtet_network.get_mesh(return_loss=False, num_subdiv=num_subdiv)
+                if self.use_dmtet_posed:
+                #     verts, faces, loss = self.dmtet_network.get_mesh(return_loss=False, num_subdiv=num_subdiv)
+                # else:
+                    verts, verts_rest, faces, loss = self.dmtet_network.get_mesh(
+                        smpl_v_rest=self.smpl_v_rest, smpl_faces=self.smpl_faces, rest_T=self.rest_T, smpl_v_T=self.smpl_v_T,
+                        return_loss=False, num_subdiv=num_subdiv)
+                elif self.opt.progressive_geo:
+                    verts, faces, loss = self.dmtet_network.get_mesh(return_loss=False, num_subdiv=num_subdiv, global_step=self.global_step)
+                else:
+                    verts, faces, loss = self.dmtet_network.get_mesh(return_loss=False, num_subdiv=num_subdiv)
+            
             self.mesh = Mesh(v=verts, f=faces.int(), device='cuda', split=True)
             self.mesh.albedo = torch.ones((2048, 2048, 3), dtype=torch.float).cuda()
             if export_uv:
@@ -260,22 +368,58 @@ class Renderer(nn.Module):
             self.mesh.v = self.mesh.v
             self.mesh.vn = self.mesh.vn
         if export_uv:
-            if self.cfg.model.use_vertex_tex:
+            if self.opt.use_vertex_tex:
                 self.mesh.v_color = self.vertex_albedo.detach().clamp(0, 1)
-            elif self.cfg.model.use_texture_2d:
+            elif self.opt.use_texture_2d:
                 self.mesh.albedo = torch.sigmoid(self.raw_albedo.detach())
             else:
                 self.mesh.albedo = self.get_albedo_from_texture3d()
         verts = torch.cat([self.mesh.v, torch.ones_like(self.mesh.v[:, :1])], dim=1) @ self.resize_matrix_inv.T
         self.mesh.v = verts
         self.mesh.write(os.path.join(save_path, '{}.obj'.format(name)))
-        if self.cfg.data.da_pose_mesh:
+        if self.opt.da_pose_mesh:
             import trimesh
-            verts = self.mesh.v.new_tensor(trimesh.load(self.cfg.data.da_pose_mesh).vertices)
+            verts = self.mesh.v.new_tensor(trimesh.load(self.opt.da_pose_mesh).vertices)
             assert verts.shape[0] == self.mesh.v.shape[0], f"pose mesh verts: {self.mesh.v.shape[0]}, da pose mesh verts: {verts.shape[0]}"
             self.mesh.v = verts
             self.mesh.write(os.path.join(save_path, '{}_da.obj'.format(name)))
 
+    @torch.no_grad()
+    def get_front_view_triangles(self, h, w):
+        if self.opt.mesh_dataset == 'phorhum':
+            TO_WORLD = np.array(
+                [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, -0.98226033, -0.18752234, 0.5],
+                    [0.0, 0.18752234, -0.98226033, 2.2],
+                    [0.0, 0.0, 0.0, 1.0],
+                ],
+                dtype=np.float32,
+            )
+            far = 1000
+            near = self.opt.min_near
+            projection = torch.tensor([
+                [2 , 0, 0, 0], 
+                [0, 2 , 0, 0],
+                [0, 0, (far + near)/(far - near), -(2 * far * near)/(far - near)], 
+                [0, 0, 1, 0]
+            ], dtype=torch.float32, device=self.device).unsqueeze(0) # yapf: disabl
+            mvp = projection @ torch.tensor(np.linalg.inv(TO_WORLD)).cuda() @ self.resize_matrix_inv
+        else:
+            TO_WORLD = np.eye(
+                4,
+                dtype=np.float32,
+            )
+            TO_WORLD[2,2] = -1
+            TO_WORLD[1,1] = -1
+            mvp = torch.tensor(np.linalg.inv(TO_WORLD)).cuda() @ self.resize_matrix_inv
+        v = self.mesh.v  # [N, 3]
+        v_clip = torch.matmul(F.pad(v, pad=(0, 1), mode='constant', value=1.0),
+                              torch.transpose(mvp, 0, 1)).float().unsqueeze(0)  # [1, N, 4]
+        rast, rast_db = dr.rasterize(self.glctx, v_clip, self.mesh.f, (h, w))
+        frontview_triangles = torch.unique(rast[..., 3].view(-1)).to(torch.long)
+        return frontview_triangles
+        
     
     @torch.no_grad()
     def get_albedo_from_texture3d(self):
@@ -285,7 +429,7 @@ class Renderer(nn.Module):
         print(uv.shape, self.mesh.ft.shape, h, w)
         rast, rastdb = dr.rasterize(self.glctx, uv.unsqueeze(0), self.mesh.ft, (h, w)) # [1, h, w, 4]
         
-        if not self.cfg.model.use_can_pose_space:
+        if not self.opt.use_can_pose_space:
             color_space_v, color_space_f = self.mesh.v, self.mesh.f
         else:
             color_space_v, color_space_f = self.can_pose_vertices[0], self.can_pose_faces[0]
@@ -303,23 +447,74 @@ class Renderer(nn.Module):
         for i in range(0, num_pts, batch_size):
             i_end = min(i + batch_size, num_pts)
             batch_pts = xyzs[i:i_end]
-            pred_color = self.texture3d(batch_pts)
+            _, pred_color, pred_norm = self.texture3d(batch_pts, None, shading='output')
             res.append(pred_color)
         mask_feats = torch.cat(res, dim=0)
+        print(feats.shape, mask.shape, mask_feats.shape)
         feats[mask] = mask_feats
         feats = feats.reshape(h, w, 3)
+        if self.opt.color_correction:
+            from skimage import exposure
+            tex_triangles = rast[0, :, :, 3].view(-1).to(torch.long) - 1
+            rast_mask = rast[0, :, :, 3] > 0
+            front_view_triangles = self.get_front_view_triangles(h,w) - 1
+            print(tex_triangles.max(), tex_triangles.min())
+            front_tri_mask = torch.zeros_like(self.mesh.ft[..., 0]).to(torch.bool).cuda()
+            print(front_tri_mask.shape)
+            front_tri_mask[front_view_triangles] = True
+            tex_front_mask = front_tri_mask[tex_triangles].reshape(h, w)
+            #Image.fromarray((((~tex_front_mask)&(rast_mask)).detach().cpu().numpy()*255).astype(np.uint8)).save('tex_front_mask.png')
+            generated = (feats[(~tex_front_mask)&(rast_mask)].detach().cpu().numpy() * 255).astype(np.uint8)
+            reference = (feats[tex_front_mask & rast_mask].detach().cpu().numpy() * 255).astype(np.uint8)
+            generated = exposure.match_histograms(generated, reference, channel_axis=-1)
+            feats[(~tex_front_mask)&(rast_mask)] = feats.new_tensor(generated/255)
         feats = self.mesh.albedo.new_tensor(texture_padding((feats.reshape(h, w, 3).cpu().numpy()*255).astype(np.uint8), (mask.reshape(h, w).cpu().numpy()*255).astype(np.uint8))) / 255
 
         return feats.reshape(self.mesh.albedo.shape)
 
+    @torch.no_grad()
+    def remesh(self):
+
+        device = self.mesh.v.device
+        if hasattr(self, 'v_offsets'):
+            v = (self.mesh.v + self.v_offsets).detach().cpu().numpy()
+        else:
+            v = self.mesh.v.detach().cpu().numpy()
+        f = self.mesh.f.detach().cpu().numpy()
+
+        v, f = remesh(v, f, remesh_size=self.opt.remesh_size)
+
+        self.mesh.v = torch.from_numpy(v).float().contiguous().to(device)  # [N, 3]
+        self.mesh.f = torch.from_numpy(f).int().contiguous().to(device)
+        self.mesh.auto_normal()
+
+        # TODO: how to keep UV while doing remesh ???
+        raise NotImplementedError
+
+        self.v_offsets = nn.Parameter(torch.zeros_like(self.mesh.v))
+        self.vn_offsets = nn.Parameter(torch.zeros_like(self.mesh.vn))
+
+        print(f'[INFO] remesh: {self.mesh.v.shape}, {self.mesh.f.shape}')
 
     def get_mesh(self, return_loss=True, detach_geo=False, global_step=1e7):
         if self.marching_tets is None and self.dmtet_network is None:
+            #return Mesh(v=self.mesh.v+self.v_offsets, base=self.mesh, device='cuda'), None
             return Mesh(v=self.mesh.v, base=self.mesh, device='cuda'), None
         loss = None
-        if self.cfg.model.use_dmtet_network:                
+        if self.opt.use_dmtet_new or self.use_dmtet_posed:                
             num_subdiv = self.get_num_subdiv(global_step=global_step)
-            verts, faces, loss = self.dmtet_network.get_mesh(return_loss=return_loss, num_subdiv=num_subdiv)
+
+            if self.use_dmtet_posed:
+            #     verts, faces, loss = self.dmtet_network.get_mesh(return_loss=return_loss, num_subdiv=num_subdiv)
+            # else:
+                verts, verts_rest, faces, loss = self.dmtet_network.get_mesh(
+                    smpl_v_rest=self.smpl_v_rest, smpl_faces=self.smpl_faces, rest_T=self.rest_T, smpl_v_T=self.smpl_v_T,
+                    return_loss=return_loss, num_subdiv=num_subdiv)
+            elif self.opt.progressive_geo:
+                verts, faces, loss = self.dmtet_network.get_mesh(return_loss=return_loss, num_subdiv=num_subdiv, global_step=global_step)
+            else:
+                verts, faces, loss = self.dmtet_network.get_mesh(return_loss=return_loss, num_subdiv=num_subdiv)
+
             if detach_geo:
                 verts = verts.detach()
                 faces = faces.detach()
@@ -328,10 +523,12 @@ class Renderer(nn.Module):
         else:
             v_deformed = self.mesh.v
             if hasattr(self, 'v_offsets'):
-                v_deformed = v_deformed + 2 / (self.cfg.model.mesh_resolution * 2) * torch.tanh(self.v_offsets)
+                v_deformed = v_deformed + 2 / (self.opt.mesh_resolution * 2) * torch.tanh(self.v_offsets)
             verts, faces, uvs, uv_idx = self.marching_tets(v_deformed, self.sdf, self.mesh.f)
             mesh = Mesh(v=verts, f=faces.int(), vt=uvs, ft=uv_idx.int())
+        #('verts.grad: {} mesh.v.grad: {}'.format(verts.requires_grad, mesh.v.requires_grad))
         mesh.auto_normal()
+    
         return mesh, loss
     
     def get_color_from_vertex_texture(self, rast, rast_db, f, light_d, ambient_ratio, shading) -> Tensor:
@@ -371,7 +568,7 @@ class Renderer(nn.Module):
         if shading == 'textureless':
             color = lambertian.unsqueeze(-1).repeat(1, 1, 1, 3)
         elif shading == 'normal':
-            if self.cfg.train.render_relative_normal and poses is not None:
+            if self.opt.render_relative_normal and poses is not None:
                 normal_shape_old = normal.shape
                 B = poses.shape[0]
                 normal = torch.matmul(F.pad(normal, pad=(0, 1), mode='constant', value=1.0).reshape(B, -1, 4),
@@ -416,7 +613,7 @@ class Renderer(nn.Module):
 
     def get_color_from_3d_texture(self, rast, rast_db, v, f, vn, light_d, ambient_ratio, shading) -> Tensor:
         xyzs, _ = dr.interpolate(v, rast, f, rast_db)
-        albedo= self.texture3d(xyzs.view(-1, 3))
+        sigma, albedo, _ = self.texture3d(xyzs.view(-1, 3), None, light_d, ambient_ratio, 'albedo')
         if vn is not None:
             normal, _ = dr.interpolate(vn.unsqueeze(0).contiguous(), rast, f)
             normal = safe_normalize(normal)
@@ -465,16 +662,17 @@ class Renderer(nn.Module):
         return draw_openpose_map(canvas, keypoints_2d.detach().cpu().numpy(), keypoints_mask.cpu().numpy())
     
     def get_num_subdiv(self, global_step=1e7):
-        if self.cfg.train.tet_subdiv_steps is not None:
+        self.global_step = global_step
+        if self.opt.tet_subdiv_steps is not None:
             num_subdiv = 0
-            for step in self.cfg.train.tet_subdiv_steps:
+            for step in self.opt.tet_subdiv_steps:
                 if global_step >= step:
                     num_subdiv += 1
             return num_subdiv
-        return self.cfg.model.tet_num_subdiv
+        return self.opt.tet_num_subdiv
 
 
-    def forward(self, rays_o, rays_d, mvp, h0, w0, light_d=None, ref_rgb=None, ambient_ratio=1.0, shading='albedo', return_loss=False, alpha_only=False, detach_geo=False, albedo_ref=False, poses=None, return_openpose_map=False, global_step=1e7, return_can_pos_map=False, mesh=None, can_pose=False):
+    def forward(self, rays_o, rays_d, mvp, h0, w0, smpl_v_T=None, light_d=None, ref_rgb=None, ambient_ratio=1.0, shading='albedo', return_loss=False, alpha_only=False, detach_geo=False, albedo_ref=False, poses=None, return_openpose_map=False, global_step=1e7, return_can_pos_map=False, mesh=None, can_pose=False):
         # mvp: [1, 4, 4]
         mvp = mvp.squeeze()
         device = mvp.device
@@ -483,10 +681,10 @@ class Renderer(nn.Module):
         rays_d = rays_d.contiguous().view(-1, 3)
 
         # do super-sampling
-        if self.cfg.model.render_ssaa > 1:
-            h = int(h0 * self.cfg.model.render_ssaa)
-            w = int(w0 * self.cfg.model.render_ssaa)
-            if not self.cfg.use_gl:
+        if self.opt.ssaa > 1:
+            h = int(h0 * self.opt.ssaa)
+            w = int(w0 * self.opt.ssaa)
+            if not self.opt.use_gl:
                 h  = min(h, 2048)
                 w  = min(w, 2048)
             dirs = rays_d.view(h0, w0, 3)
@@ -495,7 +693,7 @@ class Renderer(nn.Module):
             h, w = h0, w0
             dirs = rays_d
 
-        if self.cfg.model.single_bg_color:
+        if self.opt.single_bg_color:
             dirs = torch.ones_like(dirs)
 
         dirs = dirs / torch.norm(dirs, dim=-1, keepdim=True)
@@ -503,9 +701,9 @@ class Renderer(nn.Module):
         dirs[..., 2] = -dirs[..., 2]
 
         # mix background color
-        if self.cfg.model.different_bg and shading == 'textureless':
+        if self.opt.different_bg and shading == 'textureless':
             bg_color = torch.sigmoid(self.textureless_bg_net(self.encoder_bg(dirs))).view(h, w, 3)
-        elif self.cfg.model.different_bg and shading == 'normal':
+        elif self.opt.different_bg and shading == 'normal':
             bg_color = torch.sigmoid(self.normal_bg_net(self.encoder_bg(dirs))).view(h, w, 3)
         else:
             bg_color = torch.sigmoid(self.bg_net(self.encoder_bg(dirs))).view(h, w, 3)
@@ -529,7 +727,7 @@ class Renderer(nn.Module):
         alpha = mask.clone()
         if alpha_only:
             alpha = dr.antialias(alpha, rast, v_clip, mesh.f).squeeze(0).clamp(0, 1)  # [H, W, 3]
-            if self.cfg.model.render_ssaa > 1:
+            if self.opt.ssaa > 1:
                 alpha = scale_img_hwc(alpha, (h0, w0))
             return dict(alpha=alpha)
         # xyzs, _ = dr.interpolate(v.unsqueeze(0), rast, self.mesh.f) # [1, H, W, 3]
@@ -540,7 +738,7 @@ class Renderer(nn.Module):
         #     masked_albedo = torch.sigmoid(self.color_net(self.encoder(xyzs[mask].detach(), bound=1)))
         #     albedo[mask] = masked_albedo.float()
         # albedo = albedo.view(1, h, w, 3)cuda
-        if not self.cfg.model.use_can_pose_space:
+        if not self.opt.use_can_pose_space:
             color_space_v, color_space_f = mesh.v, mesh.f
         else:
             color_space_v, color_space_f = self.can_pose_vertices[0], self.can_pose_faces[0]
@@ -553,12 +751,15 @@ class Renderer(nn.Module):
             light_d = safe_normalize(light_d)
         if shading in ['normal', 'textureless']:
             color = self.get_color_from_mesh(mesh, rast, light_d, ambient_ratio, shading, poses=poses)
-        elif self.cfg.model.use_texture_2d:
+        elif self.opt.use_texture_2d:
             color = self.get_color_from_2d_texture(rast, rast_db, mesh, rays_o, light_d, ambient_ratio, shading)
-        elif self.cfg.model.use_vertex_tex:
+        elif self.opt.use_vertex_tex:
             color = self.get_color_from_vertex_texture(rast, rast_db, color_space_f, light_d, ambient_ratio, shading)
         else:
-            color = self.get_color_from_3d_texture(rast, rast_db, color_space_v, color_space_f, mesh.vn, light_d, ambient_ratio, shading)
+            if self.opt.detach_tex:
+                color = self.get_color_from_3d_texture(rast.detach(), rast_db, color_space_v, color_space_f, mesh.vn.detach(), light_d, ambient_ratio, shading)
+            else:
+                color = self.get_color_from_3d_texture(rast, rast_db, color_space_v, color_space_f, mesh.vn, light_d, ambient_ratio, shading)
 
         color = dr.antialias(color, rast, v_clip, mesh.f).squeeze(0).clamp(0, 1)  # [H, W, 3]
         alpha = dr.antialias(alpha, rast, v_clip, mesh.f).squeeze(0).clamp(0, 1)  # [H, W, 3]
@@ -570,16 +771,16 @@ class Renderer(nn.Module):
 
         # ssaa
 
-        if albedo_ref and not (self.cfg.model.use_vertex_tex) and (not self.cfg.model.use_texture_2d):
+        if albedo_ref and not (self.opt.use_vertex_tex) and (not self.opt.use_texture_2d):
             with torch.no_grad():
                 albedo = self.get_color_from_3d_texture(rast.detach(), rast_db.detach(), color_space_v.detach(), color_space_f, None, light_d, 1.0, 'albedo')
                 albedo = dr.antialias(albedo, rast, v_clip, mesh.f).squeeze(0).clamp(0, 1)  # [H, W, 3]
                 albedo = albedo * alpha + (1 - alpha) * bg_color
-            if self.cfg.model.render_ssaa > 1:
+            if self.opt.ssaa > 1:
                 albedo = scale_img_hwc(albedo, (h0, w0))
             results['albedo_ref'] = albedo
 
-        if self.cfg.model.render_ssaa > 1:
+        if self.opt.ssaa > 1:
             color = scale_img_hwc(color, (h0, w0))
             alpha = scale_img_hwc(alpha, (h0, w0))
             depth = scale_img_hwc(depth, (h0, w0))
@@ -595,12 +796,12 @@ class Renderer(nn.Module):
         if return_openpose_map:
             keypoints_2d = torch.matmul(F.pad(self.keypoints, pad=(0, 1), mode='constant', value=1.0),
                               torch.transpose(mvp, 0, 1)).float().unsqueeze(0)  # [1, N, 4]
-            results['openpose_map'] = depth.new_tensor(self.get_openpose_map(keypoints_2d, depth, color if self.cfg.test.test else None)) / 255
+            results['openpose_map'] = depth.new_tensor(self.get_openpose_map(keypoints_2d, depth, color if self.opt.test else None)) / 255
             # results['image'] = torch.flip(results['image'], dims=[-2])
             # results['openpose_map'] = torch.flip(results['openpose_map'], dims=[-2])
         if return_can_pos_map:
             results['can_pos_map'] = self.get_can_pos_map(rast.detach(), rast_db.detach(), mesh.f)
-            if self.cfg.model.render_ssaa > 1:
+            if self.opt.ssaa > 1:
                 results['can_pos_map'] = scale_img_hwc(results['can_pos_map'], (h0, w0))
 
         
